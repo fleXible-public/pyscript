@@ -1,7 +1,10 @@
 """Handles state variable access and change notification."""
 
 import logging
+from typing import Dict, Optional
 
+from homeassistant.core import valid_entity_id, split_entity_id
+from homeassistant.helpers.template import AllStates
 from .const import LOGGER_PATH
 
 _LOGGER = logging.getLogger(LOGGER_PATH + ".state")
@@ -27,6 +30,14 @@ class State:
         # race conditions multiple state variables are set.
         #
         self.notify_var_last = {}
+
+        #
+        # `states` object from template extensions, working exactly the
+        # same way as documented.
+        # Attribute "_is_coroutine" is needed for "asyncio.iscoroutinefunction()"
+        # fails in eval.
+        self._states = AllStates(hass)
+        setattr(self._states, "_is_coroutine", None)
 
     def notify_add(self, var_names, queue):
         """Register to notify state variables changes to be sent to queue."""
@@ -91,6 +102,34 @@ class State:
         _LOGGER.debug("setting %s = %s, attr = %s", var_name, value, attributes)
         self.hass.states.async_set(var_name, value, attributes)
 
+    def set_new(
+        self,
+        entity_id: str,
+        new_state: str,
+        attributes: Optional[Dict] = None,
+    ) -> None:
+        """Set the state of an entity, add entity if it does not exist.
+
+        Attributes is an optional dict to specify attributes of this state.
+        To remove existing attributes, set to empty dict.
+        Default is to preserve them."""
+        if not valid_entity_id(entity_id):
+            _LOGGER.error(
+                "invalid entity_id %s (should be 'domain.entity')", entity_id
+            )
+            return
+        if attributes == {}:
+            _LOGGER.debug("setting %s = %s, attr = %s", entity_id, new_state, None)
+            self.hass.states.async_set(entity_id, new_state)
+        else:
+            old_state = self.hass.states.get(entity_id)
+            old_attrs = getattr(old_state, "attributes", {})
+            updated_attrs = dict(old_attrs)
+            if attributes:
+                updated_attrs.update(attributes)
+            _LOGGER.debug("setting %s = %s, attr = %s", entity_id, new_state, updated_attrs)
+            self.hass.states.async_set(entity_id, new_state, updated_attrs)
+
     def exist(self, var_name):
         """Check if a state variable value or attribute exists in hass."""
         parts = var_name.split(".")
@@ -101,15 +140,22 @@ class State:
 
     def get(self, var_name):
         """Get a state variable value or attribute from hass."""
-        parts = var_name.split(".")
-        if len(parts) != 2 and len(parts) != 3:
+        entity_id, attr_name = var_name, None
+        num_period = var_name.count(".")
+        if num_period == 2:
+            entity_id, attr_name = var_name.rsplit(".", maxsplit=1)
+        if num_period > 2 or valid_entity_id(entity_id) is False:
             return None
-        value = self.hass.states.get(f"{parts[0]}.{parts[1]}")
-        if not value:
-            return None
-        if len(parts) == 2:
-            return value.state
-        return value.attributes.get(parts[2])
+
+        state = self.hass.states.get(entity_id)
+        if state and attr_name:
+            return state.attributes.get(attr_name)
+        else:
+            return getattr(state, "state", None)
+
+    def get_new(self, entity_id):
+        """Retrieve state of entity_id or None if not found. """
+        return self.hass.states.get(entity_id)
 
     def completions(self, root):
         """Return possible completions of state variables."""
@@ -139,7 +185,8 @@ class State:
     def register_functions(self):
         """Register state functions."""
         functions = {
-            "state.get": self.get,
-            "state.set": self.set,
+            "state.get": self.get_new,
+            "state.set": self.set_new,
+            "states": self._states,
         }
         self.handler.register(functions)
